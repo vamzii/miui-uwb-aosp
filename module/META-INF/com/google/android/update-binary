@@ -1,0 +1,24 @@
+#!/sbin/sh
+#################
+# Magisk Module Updater Script
+#################
+OUTFD=
+ZIPFILE=
+
+# If magisk is available, install through magisk
+if [ -x /data/adb/magisk/magisk64 ]; then
+  /data/adb/magisk/magisk64 --install-module ""
+  exit 0
+elif [ -x /data/adb/magisk/magisk ]; then
+  /data/adb/magisk/magisk --install-module ""
+  exit 0
+fi
+
+# Fallback: Magisk internal installer
+if [ -f /data/adb/magisk/util_functions.sh ]; then
+  . /data/adb/magisk/util_functions.sh
+  install_module
+  exit 0
+fi
+
+exit 0

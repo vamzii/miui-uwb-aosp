@@ -1,0 +1,3 @@
+ro.vendor.uwb.available=1
+persist.vendor.uwb.calibration=1
+persist.vendor.uwb.enabled=1
