@@ -72,11 +72,12 @@ This project provides an automated **Magisk / KernelSU module** and an **AOSP UW
 * Root via **Magisk v24+**, **KernelSU**, or **APatch**
 
 ### Flashing
-1. Download the latest release from the [Releases](release/) folder (or GitHub Releases):
-   * `miui_uwb_aosp_v1.1.zip`
-2. Open the **Magisk** or **KernelSU** app.
+1. Download the latest flashable ZIP from **[GitHub Releases](https://github.com/vamzii/miui-uwb-aosp/releases/latest)**:
+   * **[miui_uwb_aosp_v1.1.zip](https://github.com/vamzii/miui-uwb-aosp/releases/download/v1.1/miui_uwb_aosp_v1.1.zip)** (Recommended)
+   * **[miui_uwb_aosp.zip](https://github.com/vamzii/miui-uwb-aosp/releases/download/v1.1/miui_uwb_aosp.zip)**
+2. Open the **Magisk**, **KernelSU**, or **APatch** app.
 3. Go to **Modules** -> **Install from storage**.
-4. Select `miui_uwb_aosp_v1.1.zip` and tap install.
+4. Select the downloaded `.zip` and tap install.
 5. Reboot your device.
 
 ---
