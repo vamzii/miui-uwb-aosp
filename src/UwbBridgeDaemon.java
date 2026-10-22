@@ -327,6 +327,10 @@ public class UwbBridgeDaemon {
                             return true;
                         }
 
+                        if (code == TRANSACTION_DUMP) {
+                            return super.onTransact(code, data, reply, flags);
+                        }
+
                         switch (code) {
                             case TRANSACTION_getAdapterState: {
                                 if (reply != null) {
