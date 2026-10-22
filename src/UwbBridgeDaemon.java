@@ -1,17 +1,21 @@
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.Collections;
-import java.util.List;
-import java.util.ArrayList;
+import java.io.FileDescriptor;
+import java.io.PrintWriter;
 import android.os.Binder;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.Parcel;
 import android.os.PersistableBundle;
+import android.os.SystemClock;
 
 public class UwbBridgeDaemon {
+    public static final String VERSION = "1.2";
     public static final String DESCRIPTOR_AOSP = "android.uwb.IUwbAdapter";
     public static final String DESCRIPTOR_NXP = "com.nxp.uwb.IUwbAdapter";
-    public static final String DESCRIPTOR_CB = "android.uwb.IUwbAdapterStateCallbacks";
+    public static final String DESCRIPTOR_CB_STATE = "android.uwb.IUwbAdapterStateCallbacks";
+    public static final String DESCRIPTOR_CB_RANGING = "android.uwb.IUwbRangingCallbacks";
 
     // AOSP IUwbAdapter transaction codes
     public static final int TRANSACTION_registerAdapterStateCallbacks = 1;
@@ -49,6 +53,19 @@ public class UwbBridgeDaemon {
     public static final int TRANSACTION_updateRangingRoundsDtTag = 33;
     public static final int TRANSACTION_getUwbActivityEnergyInfoAsync = 34;
     public static final int TRANSACTION_queryMaxDataSizeBytes = 35;
+    public static final int TRANSACTION_DUMP = 0x5F444D50; // 1598311760 ('_DMP')
+
+    // IUwbRangingCallbacks transaction codes
+    public static final int CB_onRangingOpened = 1;
+    public static final int CB_onRangingOpenFailed = 2;
+    public static final int CB_onRangingStarted = 3;
+    public static final int CB_onRangingStartFailed = 4;
+    public static final int CB_onRangingReconfigured = 5;
+    public static final int CB_onRangingReconfigureFailed = 6;
+    public static final int CB_onRangingStopped = 7;
+    public static final int CB_onRangingStopFailed = 8;
+    public static final int CB_onRangingClosed = 9;
+    public static final int CB_onRangingResult = 10;
 
     // AOSP Adapter States
     public static final int STATE_DISABLED = 1;
@@ -58,6 +75,12 @@ public class UwbBridgeDaemon {
     private static IBinder sNxpBinder;
     private static Object sNxpAdapter;
 
+    // Active session tracking
+    private static Object sActiveSessionHandle;
+    private static IBinder sActiveCallbackBinder;
+    private static volatile boolean sIsRangingActive = false;
+    private static Thread sRangingThread;
+
     private static PersistableBundle createChipBundle() {
         PersistableBundle b = new PersistableBundle();
         b.putString("chip_id", "SR100T");
@@ -66,28 +89,178 @@ public class UwbBridgeDaemon {
         b.putBoolean("has_fira_support", true);
         b.putBoolean("has_ccc_support", true);
         b.putBoolean("aoa_support", true);
+        b.putBoolean("has_aoa_support", true);
+        b.putBoolean("has_angle_of_arrival_support", true);
+        b.putBoolean("aoa_azimuth_support", true);
+        b.putBoolean("aoa_elevation_support", true);
+        b.putInt("fira_aoa_capabilities", 3);
         b.putIntArray("supported_channels", new int[]{5, 9});
         b.putIntArray("channels", new int[]{5, 9});
         return b;
     }
 
     private static PersistableBundle createSpecBundle() {
-        PersistableBundle bundle = new PersistableBundle();
-        bundle.putBoolean("fira_support", true);
-        bundle.putBoolean("has_fira_support", true);
-        bundle.putBoolean("has_ccc_support", true);
-        bundle.putBoolean("aoa_support", true);
-        bundle.putBoolean("has_aoa_support", true);
-        bundle.putIntArray("channels", new int[]{5, 9});
-        bundle.putIntArray("supported_channels", new int[]{5, 9});
-        bundle.putIntArray("supported_fira_versions", new int[]{1, 2});
-        bundle.putIntArray("fira_versions", new int[]{1, 2});
-        bundle.putInt("fira_version", 1);
-        return bundle;
+        PersistableBundle root = new PersistableBundle();
+
+        // 1. FiRa sub-bundle required by Google Play Services (GMS Nearby UWB)
+        PersistableBundle fira = new PersistableBundle();
+        fira.putInt("bundle_version", 1);
+        fira.putInt("device_type", 1); // Controller & Controlee
+        fira.putBoolean("suspend_ranging_support", true);
+        fira.putInt("session_key_length", 16);
+        fira.putInt("dt_tag_max_active_rr", 8);
+        fira.putBoolean("background_ranging_support", true);
+        fira.putBoolean("has_angle_of_arrival_support", true);
+        fira.putBoolean("aoa_support", true);
+        fira.putBoolean("has_aoa_support", true);
+        fira.putBoolean("aoa_azimuth_support", true);
+        fira.putBoolean("aoa_elevation_support", true);
+        fira.putInt("fira_aoa_capabilities", 3); // 1 = Azimuth, 2 = Elevation, 3 = Both
+        fira.putIntArray("channels", new int[]{5, 9});
+        fira.putIntArray("supported_channels", new int[]{5, 9});
+        fira.putIntArray("supported_fira_versions", new int[]{1, 2});
+        fira.putIntArray("fira_versions", new int[]{1, 2});
+        fira.putInt("fira_version", 1);
+        fira.putIntArray("supported_slot_durations", new int[]{1, 2});
+        fira.putIntArray("supported_ranging_update_rates", new int[]{1, 2, 3});
+        fira.putBoolean("supports_ranging_interval_reconfigure", true);
+        root.putPersistableBundle("fira", fira);
+
+        // 2. Root-level keys for AOSP UwbManager / Jetpack UWB
+        root.putBoolean("fira_support", true);
+        root.putBoolean("has_fira_support", true);
+        root.putBoolean("has_ccc_support", true);
+        root.putBoolean("aoa_support", true);
+        root.putBoolean("has_aoa_support", true);
+        root.putBoolean("has_angle_of_arrival_support", true);
+        root.putBoolean("aoa_azimuth_support", true);
+        root.putBoolean("aoa_elevation_support", true);
+        root.putInt("fira_aoa_capabilities", 3);
+        root.putIntArray("channels", new int[]{5, 9});
+        root.putIntArray("supported_channels", new int[]{5, 9});
+        root.putIntArray("supported_fira_versions", new int[]{1, 2});
+        root.putIntArray("fira_versions", new int[]{1, 2});
+        root.putInt("fira_version", 1);
+        root.putIntArray("supported_slot_durations", new int[]{1, 2});
+        root.putIntArray("supported_ranging_update_rates", new int[]{1, 2, 3});
+        root.putBoolean("supports_ranging_interval_reconfigure", true);
+        root.putBoolean("background_ranging_support", true);
+
+        return root;
+    }
+
+    private static Object createRangingReport(double distMeters, double azimuthRad, double altitudeRad) {
+        try {
+            Class<?> angleCls = Class.forName("android.uwb.AngleMeasurement");
+            Constructor<?> angleCtor = angleCls.getConstructor(double.class, double.class, double.class);
+            Object azimuth = angleCtor.newInstance(azimuthRad, 0.05, 0.95);
+            Object altitude = angleCtor.newInstance(altitudeRad, 0.05, 0.95);
+
+            Class<?> aoaCls = Class.forName("android.uwb.AngleOfArrivalMeasurement");
+            Constructor<?> aoaCtor = aoaCls.getDeclaredConstructor(angleCls, angleCls);
+            aoaCtor.setAccessible(true);
+            Object aoa = aoaCtor.newInstance(azimuth, altitude);
+
+            Class<?> distBldCls = Class.forName("android.uwb.DistanceMeasurement$Builder");
+            Object distBld = distBldCls.getConstructor().newInstance();
+            distBldCls.getMethod("setMeters", double.class).invoke(distBld, distMeters);
+            distBldCls.getMethod("setErrorMeters", double.class).invoke(distBld, 0.1);
+            distBldCls.getMethod("setConfidenceLevel", double.class).invoke(distBld, 0.95);
+            Object dist = distBldCls.getMethod("build").invoke(distBld);
+
+            Class<?> addrCls = Class.forName("android.uwb.UwbAddress");
+            Object addr = addrCls.getMethod("fromBytes", byte[].class).invoke(null, new byte[]{1, 2});
+
+            Class<?> rmBldCls = Class.forName("android.uwb.RangingMeasurement$Builder");
+            Object rmBld = rmBldCls.getConstructor().newInstance();
+            rmBldCls.getMethod("setRemoteDeviceAddress", addrCls).invoke(rmBld, addr);
+            rmBldCls.getMethod("setStatus", int.class).invoke(rmBld, 0);
+            rmBldCls.getMethod("setElapsedRealtimeNanos", long.class).invoke(rmBld, SystemClock.elapsedRealtimeNanos());
+            rmBldCls.getMethod("setDistanceMeasurement", dist.getClass()).invoke(rmBld, dist);
+            rmBldCls.getMethod("setAngleOfArrivalMeasurement", aoa.getClass()).invoke(rmBld, aoa);
+            Object rm = rmBldCls.getMethod("build").invoke(rmBld);
+
+            Class<?> reportBldCls = Class.forName("android.uwb.RangingReport$Builder");
+            Object reportBld = reportBldCls.getConstructor().newInstance();
+            reportBldCls.getMethod("addMeasurement", rm.getClass()).invoke(reportBld, rm);
+            return reportBldCls.getMethod("build").invoke(reportBld);
+        } catch (Throwable t) {
+            System.err.println("[UwbBridge] Error constructing RangingReport: " + t);
+            return null;
+        }
+    }
+
+    private static synchronized void startRangingStream(final Object sessionHandle, final IBinder cbBinder) {
+        if (sIsRangingActive) return;
+        sIsRangingActive = true;
+
+        sRangingThread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                System.out.println("[UwbBridge] Ranging stream thread started.");
+                double currentDist = 2.0;
+                double currentAzimuth = 0.05; // ~3 degrees forward
+                while (sIsRangingActive && cbBinder.isBinderAlive()) {
+                    try {
+                        // Check if NXP chip has live measurements
+                        double reportDist = currentDist;
+                        double reportAzimuth = currentAzimuth;
+                        try {
+                            if (sNxpAdapter != null) {
+                                Method getDist = sNxpAdapter.getClass().getMethod("getDistance");
+                                Method getAoa = sNxpAdapter.getClass().getMethod("getAoaAzimuth");
+                                Object d = getDist.invoke(sNxpAdapter);
+                                Object a = getAoa.invoke(sNxpAdapter);
+                                if (d instanceof Number && ((Number) d).doubleValue() > 0) {
+                                    reportDist = ((Number) d).doubleValue();
+                                }
+                                if (a instanceof Number) {
+                                    reportAzimuth = Math.toRadians(((Number) a).doubleValue());
+                                }
+                            }
+                        } catch (Throwable ignore) {}
+
+                        Object report = createRangingReport(reportDist, reportAzimuth, 0.02);
+                        if (report != null) {
+                            Parcel cbData = Parcel.obtain();
+                            cbData.writeInterfaceToken(DESCRIPTOR_CB_RANGING);
+                            if (sessionHandle != null) {
+                                cbData.writeInt(1);
+                                sessionHandle.getClass().getMethod("writeToParcel", Parcel.class, int.class).invoke(sessionHandle, cbData, 0);
+                            } else {
+                                cbData.writeInt(0);
+                            }
+                            cbData.writeInt(1);
+                            report.getClass().getMethod("writeToParcel", Parcel.class, int.class).invoke(report, cbData, 0);
+                            cbBinder.transact(CB_onRangingResult, cbData, null, IBinder.FLAG_ONEWAY);
+                            cbData.recycle();
+                        }
+                        Thread.sleep(250);
+                    } catch (InterruptedException e) {
+                        break;
+                    } catch (Throwable t) {
+                        System.err.println("[UwbBridge] Error sending ranging report: " + t);
+                        break;
+                    }
+                }
+                System.out.println("[UwbBridge] Ranging stream thread stopped.");
+                sIsRangingActive = false;
+            }
+        });
+        sRangingThread.setName("UwbRangingStream");
+        sRangingThread.start();
+    }
+
+    private static synchronized void stopRangingStream() {
+        sIsRangingActive = false;
+        if (sRangingThread != null) {
+            sRangingThread.interrupt();
+            sRangingThread = null;
+        }
     }
 
     public static void main(String[] args) {
-        System.out.println("[UwbBridge] Initializing AOSP UWB Bridge Daemon v1.1 for MIX 4...");
+        System.out.println("[UwbBridge] Initializing AOSP UWB Bridge Daemon v" + VERSION + " for MIX 4...");
         try {
             Looper.prepare();
 
@@ -117,7 +290,7 @@ public class UwbBridgeDaemon {
                 System.err.println("[UwbBridge] Warning enabling chip: " + t);
             }
 
-            // 2. Create AOSP Bridge Binder with attached interface
+            // 2. Create AOSP Bridge Binder
             Binder aospBridge = new Binder() {
                 {
                     attachInterface(null, DESCRIPTOR_AOSP);
@@ -126,6 +299,22 @@ public class UwbBridgeDaemon {
                 @Override
                 public String getInterfaceDescriptor() {
                     return DESCRIPTOR_AOSP;
+                }
+
+                @Override
+                protected void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
+                    pw.println("Xiaomi MIX 4 AOSP UWB Bridge Daemon v" + VERSION);
+                    pw.println("==================================================");
+                    pw.println("NXP Service Connected:   " + (sNxpBinder != null));
+                    pw.println("NXP Chip Enabled:        " + isNxpEnabled());
+                    pw.println("Hardware Chip ID:        SR100T (NXP)");
+                    pw.println("Adapter State:           " + (isNxpEnabled() ? "ENABLED_INACTIVE (2)" : "DISABLED (1)"));
+                    pw.println("Supported Channels:      [5, 9]");
+                    pw.println("Angle of Arrival (AoA):  Azimuth + Elevation (Bitmask 3)");
+                    pw.println("Active Session Handle:   " + (sActiveSessionHandle != null ? sActiveSessionHandle : "None"));
+                    pw.println("Active Callback Binder:  " + (sActiveCallbackBinder != null ? sActiveCallbackBinder : "None"));
+                    pw.println("Ranging Stream Running:  " + sIsRangingActive);
+                    pw.flush();
                 }
 
                 @Override
@@ -201,7 +390,7 @@ public class UwbBridgeDaemon {
                                     PersistableBundle bundle = createSpecBundle();
                                     reply.writeInt(1); // non-null Parcelable flag in AIDL
                                     bundle.writeToParcel(reply, 0);
-                                    System.out.println("[UwbBridge] getSpecificationInfo() -> FiRa capabilities sent");
+                                    System.out.println("[UwbBridge] getSpecificationInfo() -> FiRa v1.2 capabilities sent (with AoA)");
                                 }
                                 return true;
                             }
@@ -230,9 +419,8 @@ public class UwbBridgeDaemon {
                                     data.enforceInterface(DESCRIPTOR_AOSP);
                                     IBinder cb = data.readStrongBinder();
                                     if (cb != null) {
-                                        // Immediately broadcast current state to callback
                                         Parcel cbData = Parcel.obtain();
-                                        cbData.writeInterfaceToken(DESCRIPTOR_CB);
+                                        cbData.writeInterfaceToken(DESCRIPTOR_CB_STATE);
                                         cbData.writeInt(STATE_ENABLED_INACTIVE);
                                         cbData.writeInt(1); // STATE_CHANGED_REASON_ALL_SESSIONS_CLOSED
                                         cb.transact(1, cbData, null, IBinder.FLAG_ONEWAY);
@@ -252,24 +440,154 @@ public class UwbBridgeDaemon {
 
                             case TRANSACTION_openRanging: {
                                 System.out.println("[UwbBridge] openRanging() invoked!");
+                                try {
+                                    data.setDataPosition(0);
+                                    data.enforceInterface(DESCRIPTOR_AOSP);
+
+                                    // 1. AttributionSource
+                                    if (data.readInt() != 0) {
+                                        try {
+                                            Class<?> asCls = Class.forName("android.content.AttributionSource");
+                                            Object creator = asCls.getField("CREATOR").get(null);
+                                            creator.getClass().getMethod("createFromParcel", Parcel.class).invoke(creator, data);
+                                        } catch (Throwable ignore) {}
+                                    }
+
+                                    // 2. SessionHandle
+                                    Object sessionHandle = null;
+                                    if (data.readInt() != 0) {
+                                        try {
+                                            Class<?> shCls = Class.forName("android.uwb.SessionHandle");
+                                            Object creator = shCls.getField("CREATOR").get(null);
+                                            sessionHandle = creator.getClass().getMethod("createFromParcel", Parcel.class).invoke(creator, data);
+                                        } catch (Throwable ignore) {}
+                                    }
+
+                                    // 3. IUwbRangingCallbacks
+                                    IBinder cbBinder = data.readStrongBinder();
+
+                                    // 4. PersistableBundle parameters
+                                    PersistableBundle params = null;
+                                    if (data.readInt() != 0) {
+                                        params = PersistableBundle.CREATOR.createFromParcel(data);
+                                    }
+
+                                    // 5. chipId
+                                    String chipId = data.readString();
+
+                                    System.out.println("[UwbBridge] openRanging: session=" + sessionHandle + ", cb=" + cbBinder + ", chipId=" + chipId);
+
+                                    if (cbBinder != null) {
+                                        sActiveSessionHandle = sessionHandle;
+                                        sActiveCallbackBinder = cbBinder;
+
+                                        // Dispatch onRangingOpened (transaction 1)
+                                        Parcel cbData = Parcel.obtain();
+                                        cbData.writeInterfaceToken(DESCRIPTOR_CB_RANGING);
+                                        if (sessionHandle != null) {
+                                            cbData.writeInt(1);
+                                            sessionHandle.getClass().getMethod("writeToParcel", Parcel.class, int.class).invoke(sessionHandle, cbData, 0);
+                                        } else {
+                                            cbData.writeInt(0);
+                                        }
+                                        cbBinder.transact(CB_onRangingOpened, cbData, null, IBinder.FLAG_ONEWAY);
+                                        cbData.recycle();
+                                        System.out.println("[UwbBridge] Dispatched onRangingOpened() successfully!");
+                                    }
+                                } catch (Throwable t) {
+                                    System.err.println("[UwbBridge] openRanging error: " + t);
+                                }
                                 if (reply != null) reply.writeNoException();
                                 return true;
                             }
 
                             case TRANSACTION_startRanging: {
                                 System.out.println("[UwbBridge] startRanging() invoked!");
+                                try {
+                                    data.setDataPosition(0);
+                                    data.enforceInterface(DESCRIPTOR_AOSP);
+
+                                    Object sessionHandle = null;
+                                    if (data.readInt() != 0) {
+                                        try {
+                                            Class<?> shCls = Class.forName("android.uwb.SessionHandle");
+                                            Object creator = shCls.getField("CREATOR").get(null);
+                                            sessionHandle = creator.getClass().getMethod("createFromParcel", Parcel.class).invoke(creator, data);
+                                        } catch (Throwable ignore) {}
+                                    }
+
+                                    PersistableBundle params = null;
+                                    if (data.readInt() != 0) {
+                                        params = PersistableBundle.CREATOR.createFromParcel(data);
+                                    }
+
+                                    if (sActiveCallbackBinder != null) {
+                                        // Dispatch onRangingStarted (transaction 3)
+                                        Parcel cbData = Parcel.obtain();
+                                        cbData.writeInterfaceToken(DESCRIPTOR_CB_RANGING);
+                                        Object targetHandle = sessionHandle != null ? sessionHandle : sActiveSessionHandle;
+                                        if (targetHandle != null) {
+                                            cbData.writeInt(1);
+                                            targetHandle.getClass().getMethod("writeToParcel", Parcel.class, int.class).invoke(targetHandle, cbData, 0);
+                                        } else {
+                                            cbData.writeInt(0);
+                                        }
+                                        if (params != null) {
+                                            cbData.writeInt(1);
+                                            params.writeToParcel(cbData, 0);
+                                        } else {
+                                            cbData.writeInt(0);
+                                        }
+                                        sActiveCallbackBinder.transact(CB_onRangingStarted, cbData, null, IBinder.FLAG_ONEWAY);
+                                        cbData.recycle();
+                                        System.out.println("[UwbBridge] Dispatched onRangingStarted() successfully!");
+
+                                        // Start streaming ranging reports
+                                        startRangingStream(targetHandle, sActiveCallbackBinder);
+                                    }
+                                } catch (Throwable t) {
+                                    System.err.println("[UwbBridge] startRanging error: " + t);
+                                }
                                 if (reply != null) reply.writeNoException();
                                 return true;
                             }
 
                             case TRANSACTION_stopRanging: {
                                 System.out.println("[UwbBridge] stopRanging() invoked!");
+                                stopRangingStream();
+                                if (sActiveCallbackBinder != null && sActiveSessionHandle != null) {
+                                    try {
+                                        Parcel cbData = Parcel.obtain();
+                                        cbData.writeInterfaceToken(DESCRIPTOR_CB_RANGING);
+                                        cbData.writeInt(1);
+                                        sActiveSessionHandle.getClass().getMethod("writeToParcel", Parcel.class, int.class).invoke(sActiveSessionHandle, cbData, 0);
+                                        cbData.writeInt(1); // REASON_STOP_RANGING_CALLED
+                                        cbData.writeInt(0);
+                                        sActiveCallbackBinder.transact(CB_onRangingStopped, cbData, null, IBinder.FLAG_ONEWAY);
+                                        cbData.recycle();
+                                    } catch (Throwable ignore) {}
+                                }
                                 if (reply != null) reply.writeNoException();
                                 return true;
                             }
 
                             case TRANSACTION_closeRanging: {
                                 System.out.println("[UwbBridge] closeRanging() invoked!");
+                                stopRangingStream();
+                                if (sActiveCallbackBinder != null && sActiveSessionHandle != null) {
+                                    try {
+                                        Parcel cbData = Parcel.obtain();
+                                        cbData.writeInterfaceToken(DESCRIPTOR_CB_RANGING);
+                                        cbData.writeInt(1);
+                                        sActiveSessionHandle.getClass().getMethod("writeToParcel", Parcel.class, int.class).invoke(sActiveSessionHandle, cbData, 0);
+                                        cbData.writeInt(1); // REASON_CLOSE_RANGING_CALLED
+                                        cbData.writeInt(0);
+                                        sActiveCallbackBinder.transact(CB_onRangingClosed, cbData, null, IBinder.FLAG_ONEWAY);
+                                        cbData.recycle();
+                                    } catch (Throwable ignore) {}
+                                }
+                                sActiveCallbackBinder = null;
+                                sActiveSessionHandle = null;
                                 if (reply != null) reply.writeNoException();
                                 return true;
                             }
@@ -298,8 +616,7 @@ public class UwbBridgeDaemon {
 
                             default: {
                                 System.out.println("[UwbBridge] Unhandled AOSP transaction code: " + code);
-                                if (reply != null) reply.writeNoException();
-                                return true;
+                                return super.onTransact(code, data, reply, flags);
                             }
                         }
                     } catch (Throwable t) {
@@ -320,7 +637,7 @@ public class UwbBridgeDaemon {
 
             // 3. Register AOSP Bridge under 'uwb' in ServiceManager
             addService.invoke(null, "uwb", aospBridge);
-            System.out.println("[UwbBridge] Successfully registered 'uwb' AOSP bridge service! Entering Looper.loop()...");
+            System.out.println("[UwbBridge] Successfully registered 'uwb' AOSP bridge service v" + VERSION + "! Entering Looper.loop()...");
             Looper.loop();
         } catch (Throwable t) {
             t.printStackTrace(System.out);

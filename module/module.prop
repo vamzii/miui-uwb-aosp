@@ -1,6 +1,6 @@
 id=miui_uwb_aosp
 name=Xiaomi MIX 4 AOSP UWB Enabler
-version=1.0
-versionCode=2
+version=1.2
+versionCode=3
 author=Antigravity
-description=Enables standard AOSP UWB hardware feature flags and configuration for Xiaomi MIX 4 (odin) on MIUI / HyperOS.
+description=Enables standard AOSP UWB hardware feature flags, FiRa AoA directional arrow capabilities, and ranging bridge for Xiaomi MIX 4 (odin) on MIUI / HyperOS.
